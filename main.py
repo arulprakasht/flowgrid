@@ -35,13 +35,37 @@ for i in range(NUM_ORDERS):
         y = np.random.randint(0, GRID_SIZE)
     orders.append({"id": i, "pos": (x, y), "delivered": False})
 
+# === Agent Memory: Log events in Redis ===
+def log_agent_event(vehicle_id, event):
+    timestamp = time.time()
+    r.rpush(f"vehicle:{vehicle_id}:memory", json.dumps({"time": timestamp, "event": event}))
+
+# === Smarter Vehicle Assignment (dynamic, load-balanced) ===
+def assign_order_to_vehicle(order, vehicles, traffic_zone):
+    # Assign to vehicle with shortest route and not heading into traffic
+    best_v = None
+    best_score = float('inf')
+    for v_id, v in vehicles.items():
+        route = json.loads(r.hget(f"vehicle:{v_id}", "route") or "[]")
+        last_pos = route[-1] if route else DEPOT
+        dist = abs(last_pos[0] - order["pos"][0]) + abs(last_pos[1] - order["pos"][1])
+        # Penalize if route passes through traffic zone
+        traffic_penalty = 10 if traffic_zone in route else 0
+        score = dist + len(route) + traffic_penalty
+        if score < best_score:
+            best_score = score
+            best_v = v_id
+    # Assign order to best vehicle
+    vehicles[best_v]["route"].append(order["pos"])
+    vehicles[best_v]["route"].append(DEPOT)
+    r.hset(f"vehicle:{best_v}", "route", json.dumps(vehicles[best_v]["route"]))
+    log_agent_event(best_v, f"Assigned new order {order['id']} at {order['pos']}")
+    return best_v
+
 # === Assign orders to vehicles (greedy clustering) ===
 vehicles = {i: {"pos": DEPOT, "route": [DEPOT], "delivered": 0} for i in range(NUM_VEHICLES)}
 for order in orders:
-    # Assign to closest vehicle by current position
-    v_id = min(vehicles, key=lambda v: abs(vehicles[v]["pos"][0] - order["pos"][0]) + abs(vehicles[v]["pos"][1] - order["pos"][1]))
-    vehicles[v_id]["route"].append(order["pos"])
-    vehicles[v_id]["route"].append(DEPOT)  # return
+    assign_order_to_vehicle(order, vehicles, None)
 
 # Save initial state to Redis
 for v_id, data in vehicles.items():
@@ -51,11 +75,6 @@ for v_id, data in vehicles.items():
         "route": json.dumps(data["route"]),
         "delivered": 0
     })
-
-# === Agent Memory: Log events in Redis ===
-def log_agent_event(vehicle_id, event):
-    timestamp = time.time()
-    r.rpush(f"vehicle:{vehicle_id}:memory", json.dumps({"time": timestamp, "event": event}))
 
 # === Simulate movement & Redis real-time sync ===
 def move_vehicles():
@@ -187,6 +206,27 @@ for v_id in range(NUM_VEHICLES):
     vehicle_data.append({"lon": lon, "lat": lat, "vehicle": v_id, "status": status, "prediction": prediction, "color": color})
 vehicle_df = pd.DataFrame(vehicle_data)
 
+# === Custom Truck Icon Layer for Vehicles ===
+TRUCK_ICON_URL = "https://cdn-icons-png.flaticon.com/512/616/616492.png"  # Example truck icon
+icon_data = {
+    "url": TRUCK_ICON_URL,
+    "width": 64,
+    "height": 64,
+    "anchorY": 64
+}
+vehicle_icon_df = pd.DataFrame([
+    {"lon": v["lon"], "lat": v["lat"], "vehicle": v["vehicle"], "status": v["status"], "prediction": v["prediction"], "icon_data": icon_data} for v in vehicle_data
+])
+layer_vehicle_icons = pdk.Layer(
+    "IconLayer",
+    vehicle_icon_df,
+    get_icon="icon_data",
+    get_position='[lon, lat]',
+    size_scale=8,
+    pickable=True,
+    get_color=[255,255,255],
+)
+
 # Orders and depot in lat/lon
 order_data = []
 for o in orders:
@@ -276,12 +316,12 @@ st.markdown(legend_html, unsafe_allow_html=True)
 
 saved_amount = "+6,800 miles avoided"  # You can compute this dynamically if needed
 st.pydeck_chart(pdk.Deck(
-    layers=[layer_paths, layer_orders, layer_depot, layer_vehicles, layer_traffic],
+    layers=[layer_paths, layer_orders, layer_depot, layer_vehicle_icons, layer_traffic],
     initial_view_state=view_state,
     map_style=OSM_BASEMAP,
     tooltip={
-        "html": "<b>Vehicle {vehicle}</b><br>Status: {status}<br>Prediction: {prediction}<br>Saved: " + saved_amount,
-        "style": {"backgroundColor": "white", "color": "#222", "fontSize": "14px"}
+        "html": "<b>🚚 Vehicle {vehicle}</b><br>Status: {status}<br>Prediction: {prediction}<br><i>Agent says:</i> {status} | {prediction}",
+        "style": {"backgroundColor": "white", "color": "#222", "fontSize": "15px"}
     }
 ))
 
@@ -310,6 +350,53 @@ st.metric("Avg Delivery Time (s)", f"{avg_delivery_time:.2f}")
 st.metric("Avg Delivery Miles", f"{avg_delivery_miles:.2f}")
 st.metric("Total Miles", f"{total_miles:.2f}")
 
+# === Advanced Agent Reasoning (learning, collaboration) ===
+def get_advanced_agent_reasoning(vehicle_id):
+    memory = r.lrange(f"vehicle:{vehicle_id}:memory", -20, -1)
+    recent_events = [json.loads(e)["event"] for e in memory]
+    traffic_count = sum("Rerouted" in e for e in recent_events)
+    delivery_count = sum("Delivered package" in e for e in recent_events)
+    if traffic_count > 2:
+        return "Learning: Avoiding frequent traffic zones, sharing info with fleet."
+    if delivery_count > 5:
+        return "High delivery rate, optimizing future assignments."
+    if any("Assigned new order" in e for e in recent_events):
+        return "Recently assigned new orders, monitoring route efficiency."
+    return get_agent_reasoning(vehicle_id)
+
+# === Fault Tolerance, Error Handling, Security ===
+def safe_redis_hget(key, field, default=None):
+    try:
+        val = r.hget(key, field)
+        return val if val is not None else default
+    except Exception as e:
+        log_agent_event(key, f"Redis error: {str(e)}")
+        return default
+
+def safe_redis_hset(key, mapping):
+    try:
+        r.hset(key, mapping=mapping)
+    except Exception as e:
+        log_agent_event(key, f"Redis error: {str(e)}")
+
+# === Enhanced Sidebar: Agentic AI Chat & Status ===
+st.sidebar.header("Agentic AI Control & Chat")
+user_message = st.sidebar.text_input("Ask the AI agent something:", "How are deliveries going?")
+if st.sidebar.button("Send to Agent"):
+    # Simulate agentic response (could be LLM in future)
+    response = f"Agent: Based on current memory, deliveries are {'on track' if avg_delivery_time < 60 else 'delayed'}. Traffic zone at {traffic_zone}."
+    st.sidebar.success(response)
+
+# === Optional: Integration with Local LLMs (Ollama, etc.) ===
+def llm_agent_reasoning(vehicle_id, context):
+    # Placeholder: If Ollama or other LLM is available, call it here
+    # Otherwise, fallback to rule-based
+    try:
+        # import ollama, call ollama.chat() etc.
+        return get_advanced_agent_reasoning(vehicle_id)
+    except Exception:
+        return get_advanced_agent_reasoning(vehicle_id)
+
 # === Agent Reasoning: Simple rule-based agent ===
 def get_agent_reasoning(vehicle_id):
     memory = r.lrange(f"vehicle:{vehicle_id}:memory", -5, -1)
@@ -320,11 +407,30 @@ def get_agent_reasoning(vehicle_id):
         return "Focused on deliveries, monitoring for traffic."
     return "No recent events."
 
-# Show agent memory and reasoning in dashboard
+# === Show agent thoughts in sidebar (after function definitions) ===
+for v_id in range(NUM_VEHICLES):
+    thought = llm_agent_reasoning(v_id, None)
+    st.sidebar.markdown(f"<div style='background:#f0f8ff;padding:8px;border-radius:6px;margin-bottom:4px;'><b>🚚 Vehicle {v_id}:</b> <i>{thought}</i></div>", unsafe_allow_html=True)
+
+# === Optional: More Business Metrics, Historical Analytics ===
+st.subheader("Historical Analytics & Reporting")
+history = []
+for v_id in range(NUM_VEHICLES):
+    deliveries = int(safe_redis_hget(f"vehicle:{v_id}", "delivered", 0))
+    for d in range(1, deliveries + 1):
+        t = float(safe_redis_hget(f"vehicle:{v_id}", f"delivery_time_{d}", 0))
+        m = float(safe_redis_hget(f"vehicle:{v_id}", f"delivery_miles_{d}", 0))
+        history.append({"vehicle": v_id, "delivery": d, "time": t, "miles": m})
+history_df = pd.DataFrame(history)
+if not history_df.empty:
+    st.dataframe(history_df)
+    st.line_chart(history_df.groupby("vehicle")["miles"].sum())
+
+# === Enhanced Agent Reasoning in Dashboard (after function definitions) ===
 st.subheader("Agent Memory & Reasoning")
 for v_id in range(NUM_VEHICLES):
     reasoning = get_agent_reasoning(v_id)
-    st.write(f"Vehicle {v_id}: {reasoning}")
+    st.markdown(f"<b>🚚 Vehicle {v_id}:</b> <span style='color:#0066ff'>{reasoning}</span>", unsafe_allow_html=True)
     memory = r.lrange(f"vehicle:{v_id}:memory", -3, -1)
     for e in memory:
         event = json.loads(e)
