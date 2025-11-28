@@ -1,0 +1,6 @@
+redis
+streamlit
+numpy
+pandas
+pydeck
+

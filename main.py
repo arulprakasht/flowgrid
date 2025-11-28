@@ -1,437 +1,63 @@
-# main.py — FlowGrid Logistics streamlit run main.py
-import redis
+# main.py - Orchestrator for FlowGrid Logistics AI Agent
+
 import streamlit as st
-import numpy as np
-import time
-import json
-from threading import Thread
-import pandas as pd
-import pydeck as pdk
 import random
+from simulation import initialize_simulation, start_simulation, safe_redis_hget, safe_redis_hset
+from ui import render_ui
+from config import GRID_SIZE, NUM_VEHICLES
 
-# === Redis connection (the heart of everything) ===
-r = redis.Redis(host='localhost', port=6379, db=0)
+# --- Application Orchestration ---
 
-# Clear old data
-r.flushdb()
-
-# === Config ===
-# NUM_VEHICLES = 25'
-NUM_VEHICLES = 5
-NUM_ORDERS = 50
-GRID_SIZE = 20  # 20x20 = rough King County in miles
-DEPOT = (0, 0)
-
-# === Generate realistic Seattle-ish orders ===
-np.random.seed(42)
-orders = []
-for i in range(NUM_ORDERS):
-    # 40% downtown (high density), 60% suburbs
-    if np.random.rand() < 0.4:
-        x = np.random.randint(6, 14)
-        y = np.random.randint(4, 16)
-    else:
-        x = np.random.randint(0, GRID_SIZE)
-        y = np.random.randint(0, GRID_SIZE)
-    orders.append({"id": i, "pos": (x, y), "delivered": False})
-
-# === Agent Memory: Log events in Redis ===
-def log_agent_event(vehicle_id, event):
-    timestamp = time.time()
-    r.rpush(f"vehicle:{vehicle_id}:memory", json.dumps({"time": timestamp, "event": event}))
-
-# === Smarter Vehicle Assignment (dynamic, load-balanced) ===
-def assign_order_to_vehicle(order, vehicles, traffic_zone):
-    # Assign to vehicle with shortest route and not heading into traffic
-    best_v = None
-    best_score = float('inf')
-    for v_id, v in vehicles.items():
-        route = json.loads(r.hget(f"vehicle:{v_id}", "route") or "[]")
-        last_pos = route[-1] if route else DEPOT
-        dist = abs(last_pos[0] - order["pos"][0]) + abs(last_pos[1] - order["pos"][1])
-        # Penalize if route passes through traffic zone
-        traffic_penalty = 10 if traffic_zone in route else 0
-        score = dist + len(route) + traffic_penalty
-        if score < best_score:
-            best_score = score
-            best_v = v_id
-    # Assign order to best vehicle
-    vehicles[best_v]["route"].append(order["pos"])
-    vehicles[best_v]["route"].append(DEPOT)
-    r.hset(f"vehicle:{best_v}", "route", json.dumps(vehicles[best_v]["route"]))
-    log_agent_event(best_v, f"Assigned new order {order['id']} at {order['pos']}")
-    return best_v
-
-# === Assign orders to vehicles (greedy clustering) ===
-vehicles = {i: {"pos": DEPOT, "route": [DEPOT], "delivered": 0} for i in range(NUM_VEHICLES)}
-for order in orders:
-    assign_order_to_vehicle(order, vehicles, None)
-
-# Save initial state to Redis
-for v_id, data in vehicles.items():
-    r.hset(f"vehicle:{v_id}", mapping={
-        "pos_x": data["pos"][0],
-        "pos_y": data["pos"][1],
-        "route": json.dumps(data["route"]),
-        "delivered": 0
-    })
-
-# === Simulate movement & Redis real-time sync ===
-def move_vehicles():
-    step = 0
-    while True:
-        for v_id in vehicles:
-            route = json.loads(r.hget(f"vehicle:{v_id}", "route") or "[]")
-            if step < len(route):
-                new_pos = route[step]
-                # Check for traffic jam and slow down or reroute
-                if step >= traffic_step and new_pos == traffic_zone:
-                    # Reroute: skip traffic zone by detouring to adjacent cell
-                    x, y = new_pos
-                    if x < GRID_SIZE - 1:
-                        detour = (x + 1, y)
-                    else:
-                        detour = (x - 1, y)
-                    r.hset(f"vehicle:{v_id}", mapping={"pos_x": detour[0], "pos_y": detour[1]})
-                    r.hset(f"vehicle:{v_id}", "rerouting", 1)
-                    log_agent_event(v_id, f"Rerouted at traffic zone {traffic_zone} from {new_pos} to {detour}")
-                    time.sleep(0.5)  # Slow down in traffic
-                else:
-                    r.hset(f"vehicle:{v_id}", mapping={"pos_x": new_pos[0], "pos_y": new_pos[1]})
-                    r.hset(f"vehicle:{v_id}", "rerouting", 0)
-                    log_agent_event(v_id, f"Moved to {new_pos}")
-                # Count delivery when passing through non-depot
-                if new_pos != DEPOT and step > 0 and route[step-1] == DEPOT:
-                    delivered = int(r.hget(f"vehicle:{v_id}", "delivered") or 0) + 1
-                    r.hset(f"vehicle:{v_id}", "delivered", delivered)
-                    r.publish("delivery", f"Vehicle {v_id} delivered package!")
-                    # Save delivery time and miles
-                    miles = abs(new_pos[0] - route[step-1][0]) + abs(new_pos[1] - route[step-1][1])
-                    r.hset(f"vehicle:{v_id}", f"delivery_time_{delivered}", time.time())
-                    r.hset(f"vehicle:{v_id}", f"delivery_miles_{delivered}", miles)
-                    log_agent_event(v_id, f"Delivered package at {new_pos}, miles: {miles}")
-        step += 1
-        time.sleep(0.3)
-
-# Start background mover
-Thread(target=move_vehicles, daemon=True).start()
-
-# === Streamlit Dashboard (the loveable part) ===
-st.title("FlowGrid Logistics — Live Seattle Demo")
-st.write("500 packages • 25 vehicles • Real-time Redis coordination")
-
-cols = st.columns(4)
-with cols[0]:
-    st.metric("Total Deliveries", f"{sum(int(r.hget(f'vehicle:{i}', 'delivered') or 0) for i in range(NUM_VEHICLES))}/500")
-with cols[1]:
-    st.metric("Active Vehicles", sum(1 for i in range(NUM_VEHICLES) if json.loads(r.hget(f'vehicle:{i}', 'route') or '[]')))
-with cols[2]:
-    st.metric("Distance Saved", "22 %", "+6,800 miles avoided")
-with cols[3]:
-    st.metric("Cost per Mile", "$0.045", "-$0.012")
-
-# Seattle center coordinates
-SEATTLE_CENTER = (-122.335167, 47.608013)  # (longitude, latitude)
-GRID_MILES = 20
-
-# Helper: convert grid x/y to lat/lon (roughly)
-def grid_to_latlon(x, y):
-    # 1 mile ~ 0.0145 deg latitude, ~0.018 deg longitude
-    lat = SEATTLE_CENTER[1] + (y - GRID_MILES/2) * 0.0145
-    lon = SEATTLE_CENTER[0] + (x - GRID_MILES/2) * 0.018
-    return lon, lat
-
-# === Live Map Visualization with OpenStreetMap (OSM) ===
-# Uses pydeck with Carto's OSM basemap, no API key required.
-# Shows vehicles, depot, delivery points, and vehicle paths with status-based colors.
-
-# Use Carto Voyager OSM basemap (no API key needed)
-OSM_BASEMAP = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json"
-
-# === Weather & Traffic Simulation ===
-# Simulate random weather events and traffic jams on the grid
-weather_types = ["clear", "rain", "fog", "snow"]
-current_weather = random.choice(weather_types)
-# Simulate a traffic jam zone (random block after step 20)
-traffic_zone = None
+# 1. Initialize Traffic Simulation Parameters (using Streamlit session state for persistence)
 if 'traffic_step' not in st.session_state:
-    st.session_state['traffic_step'] = random.randint(20, 40)
+    # Traffic starts randomly between step 20 and 40
+    st.session_state['traffic_step'] = random.randint(20, 40) 
 if 'traffic_zone' not in st.session_state:
-    st.session_state['traffic_zone'] = (random.randint(5, 15), random.randint(5, 15))
-traffic_step = st.session_state['traffic_step']
-traffic_zone = st.session_state['traffic_zone']
+    # Traffic zone is a random block in the grid
+    st.session_state['traffic_zone'] = (random.randint(5, GRID_SIZE - 5), random.randint(5, GRID_SIZE - 5))
 
-# Show weather and traffic in dashboard
-st.metric("Weather", current_weather.title())
-st.metric("Traffic Jam Zone", f"x={traffic_zone[0]}, y={traffic_zone[1]} (from step {traffic_step})")
+# 2. Initialize Simulation State (Orders and Vehicles in Redis)
+orders = initialize_simulation()
 
-# Helper: determine vehicle status (idle, delivering, rerouting)
-def get_vehicle_status(v_id, step):
-    route = json.loads(r.hget(f"vehicle:{v_id}", "route") or "[]")
-    if step < len(route):
-        x, y = route[step]
-        # Rerouting if in detour zone after traffic jam
-        if step >= 30 and 8 <= x <= 12:
-            return "rerouting"
-        # Idle if at depot
-        if (x, y) == DEPOT:
-            return "idle"
-        return "delivering"
-    return "idle"
+# 3. Start Background Simulation Thread
+# This is safe to call multiple times, as the thread is only started once 
+# and runs forever (daemon=True)
+start_simulation(st.session_state['traffic_step'], st.session_state['traffic_zone'])
 
-# === Predictive UI: Show if a vehicle will hit traffic soon ===
-def will_hit_traffic(v_id, step):
-    route = json.loads(r.hget(f"vehicle:{v_id}", "route") or "[]")
-    for future_step in range(step, min(step+5, len(route))):
-        x, y = route[future_step]
-        if traffic_step <= future_step and (x, y) == traffic_zone:
-            return True
-    return False
+# 4. Render Streamlit UI (This loop runs continuously)
 
-# Update vehicle status to include prediction
-vehicle_data = []
-for v_id in range(NUM_VEHICLES):
-    x = float(r.hget(f"vehicle:{v_id}", "pos_x") or 0)
-    y = float(r.hget(f"vehicle:{v_id}", "pos_y") or 0)
-    lon, lat = grid_to_latlon(x, y)
-    route = json.loads(r.hget(f"vehicle:{v_id}", "route") or "[]")
-    step = 0
-    for idx, (rx, ry) in enumerate(route):
-        if rx == x and ry == y:
-            step = idx
-            break
-    status = get_vehicle_status(v_id, step)
-    prediction = "Will hit traffic soon" if will_hit_traffic(v_id, step) else "Clear"
-    color = [0, 102, 255, 180] if status == "delivering" else ([255, 0, 0, 180] if status == "rerouting" else [120, 120, 120, 180])
-    vehicle_data.append({"lon": lon, "lat": lat, "vehicle": v_id, "status": status, "prediction": prediction, "color": color})
-vehicle_df = pd.DataFrame(vehicle_data)
-
-# === Custom Truck Icon Layer for Vehicles ===
-TRUCK_ICON_URL = "https://cdn-icons-png.flaticon.com/512/616/616492.png"  # Example truck icon
-icon_data = {
-    "url": TRUCK_ICON_URL,
-    "width": 64,
-    "height": 64,
-    "anchorY": 64
-}
-vehicle_icon_df = pd.DataFrame([
-    {"lon": v["lon"], "lat": v["lat"], "vehicle": v["vehicle"], "status": v["status"], "prediction": v["prediction"], "icon_data": icon_data} for v in vehicle_data
-])
-layer_vehicle_icons = pdk.Layer(
-    "IconLayer",
-    vehicle_icon_df,
-    get_icon="icon_data",
-    get_position='[lon, lat]',
-    size_scale=8,
-    pickable=True,
-    get_color=[255,255,255],
-)
-
-# Orders and depot in lat/lon
-order_data = []
-for o in orders:
-    lon, lat = grid_to_latlon(o["pos"][0], o["pos"][1])
-    order_data.append({"lon": lon, "lat": lat})
-order_df = pd.DataFrame(order_data)
-depot_lon, depot_lat = grid_to_latlon(DEPOT[0], DEPOT[1])
-depot_df = pd.DataFrame([{"lon": depot_lon, "lat": depot_lat}])
-
-# Draw vehicle paths (lines)
-path_data = []
-for v_id in range(NUM_VEHICLES):
-    route = json.loads(r.hget(f"vehicle:{v_id}", "route") or "[]")
-    path = [grid_to_latlon(x, y) for x, y in route]
-    path_data.append({"path": path})
-path_df = pd.DataFrame(path_data)
-
-# Draw traffic zone on map
-traffic_lon, traffic_lat = grid_to_latlon(traffic_zone[0], traffic_zone[1])
-traffic_df = pd.DataFrame([{"lon": traffic_lon, "lat": traffic_lat}])
-layer_traffic = pdk.Layer(
-    "ScatterplotLayer",
-    traffic_df,
-    get_position="[lon, lat]",
-    get_color="[255, 0, 0, 200]",
-    get_radius=120,
-    pickable=False,
-)
-
-layer_paths = pdk.Layer(
-    "PathLayer",
-    path_df,
-    get_path="path",
-    get_color=[200, 200, 200, 80],
-    width_scale=10,
-    width_min_pixels=2,
-    width_max_pixels=4,
-    pickable=False,
-)
-layer_vehicles = pdk.Layer(
-    "ScatterplotLayer",
-    vehicle_df,
-    get_position="[lon, lat]",
-    get_color="color",
-    get_radius=80,
-    pickable=True,
-)
-layer_orders = pdk.Layer(
-    "ScatterplotLayer",
-    order_df,
-    get_position="[lon, lat]",
-    get_color="[255, 140, 0, 120]",
-    get_radius=40,
-    pickable=False,
-)
-layer_depot = pdk.Layer(
-    "ScatterplotLayer",
-    depot_df,
-    get_position="[lon, lat]",
-    get_color="[0, 200, 0, 200]",
-    get_radius=100,
-    pickable=False,
-)
-
-view_state = pdk.ViewState(
-    longitude=SEATTLE_CENTER[0],
-    latitude=SEATTLE_CENTER[1],
-    zoom=11,
-    min_zoom=8,
-    max_zoom=15,
-    pitch=0,
-)
-
-# Add legend and enhanced tooltips for map visualization
-legend_html = '''
-<div style="position: absolute; z-index: 1000; background: white; padding: 10px; border-radius: 8px; font-size: 14px; left: 20px; top: 80px; box-shadow: 0 2px 8px rgba(0,0,0,0.15);">
-<b>Legend</b><br>
-<span style="color: #00c800; font-weight: bold;">&#9679;</span> Depot<br>
-<span style="color: #ff8c00; font-weight: bold;">&#9679;</span> Delivery Point<br>
-<span style="color: #0066ff; font-weight: bold;">&#9679;</span> Vehicle (delivering)<br>
-<span style="color: #ff0000; font-weight: bold;">&#9679;</span> Vehicle (rerouting)<br>
-<span style="color: #888888; font-weight: bold;">&#9679;</span> Vehicle (idle)<br>
-<span style="color: #ff0000; font-weight: bold;">&#9679;</span> Traffic Jam Zone
-</div>
-'''
-st.markdown(legend_html, unsafe_allow_html=True)
-
-saved_amount = "+6,800 miles avoided"  # You can compute this dynamically if needed
-st.pydeck_chart(pdk.Deck(
-    layers=[layer_paths, layer_orders, layer_depot, layer_vehicle_icons, layer_traffic],
-    initial_view_state=view_state,
-    map_style=OSM_BASEMAP,
-    tooltip={
-        "html": "<b>🚚 Vehicle {vehicle}</b><br>Status: {status}<br>Prediction: {prediction}<br><i>Agent says:</i> {status} | {prediction}",
-        "style": {"backgroundColor": "white", "color": "#222", "fontSize": "15px"}
-    }
-))
-
-# === Key Metrics: Average Delivery Time and Miles ===
-avg_delivery_time = 0
-avg_delivery_miles = 0
-total_deliveries = 0
+# Compute metrics needed for the UI
+total_delivery_time_sum = 0
+total_delivery_miles_sum = 0
+total_deliveries_computed = 0
 total_miles = 0
+
+# Compute metrics from Redis
 for v_id in range(NUM_VEHICLES):
-    delivered = int(r.hget(f"vehicle:{v_id}", "delivered") or 0)
-    total_deliveries += delivered
+    delivered = int(safe_redis_hget(f"vehicle:{v_id}", "delivered", 0))
+    total_deliveries_computed += delivered
     for d in range(1, delivered + 1):
-        t = float(r.hget(f"vehicle:{v_id}", f"delivery_time_{d}") or 0)
-        m = float(r.hget(f"vehicle:{v_id}", f"delivery_miles_{d}") or 0)
-        avg_delivery_time += t
-        avg_delivery_miles += m
+        t = float(safe_redis_hget(f"vehicle:{v_id}", f"delivery_time_{d}", 0))
+        m = float(safe_redis_hget(f"vehicle:{v_id}", f"delivery_miles_{d}", 0))
+        total_delivery_time_sum += t
+        total_delivery_miles_sum += m
         total_miles += m
-if total_deliveries > 0:
-    avg_delivery_time = avg_delivery_time / total_deliveries
-    avg_delivery_miles = avg_delivery_miles / total_deliveries
+
+if total_deliveries_computed > 0:
+    avg_delivery_time = total_delivery_time_sum / total_deliveries_computed
+    avg_delivery_miles = total_delivery_miles_sum / total_deliveries_computed
 else:
     avg_delivery_time = 0
     avg_delivery_miles = 0
 
-st.metric("Avg Delivery Time (s)", f"{avg_delivery_time:.2f}")
-st.metric("Avg Delivery Miles", f"{avg_delivery_miles:.2f}")
-st.metric("Total Miles", f"{total_miles:.2f}")
+# Store metrics in Redis for ui.py to retrieve
+safe_redis_hset("metrics", mapping={
+    "avg_delivery_time": avg_delivery_time,
+    "avg_delivery_miles": avg_delivery_miles,
+    "total_deliveries_computed": total_deliveries_computed,
+    "total_miles": total_miles
+})
 
-# === Advanced Agent Reasoning (learning, collaboration) ===
-def get_advanced_agent_reasoning(vehicle_id):
-    memory = r.lrange(f"vehicle:{vehicle_id}:memory", -20, -1)
-    recent_events = [json.loads(e)["event"] for e in memory]
-    traffic_count = sum("Rerouted" in e for e in recent_events)
-    delivery_count = sum("Delivered package" in e for e in recent_events)
-    if traffic_count > 2:
-        return "Learning: Avoiding frequent traffic zones, sharing info with fleet."
-    if delivery_count > 5:
-        return "High delivery rate, optimizing future assignments."
-    if any("Assigned new order" in e for e in recent_events):
-        return "Recently assigned new orders, monitoring route efficiency."
-    return get_agent_reasoning(vehicle_id)
+render_ui(orders, total_miles, total_deliveries_computed)
 
-# === Fault Tolerance, Error Handling, Security ===
-def safe_redis_hget(key, field, default=None):
-    try:
-        val = r.hget(key, field)
-        return val if val is not None else default
-    except Exception as e:
-        log_agent_event(key, f"Redis error: {str(e)}")
-        return default
-
-def safe_redis_hset(key, mapping):
-    try:
-        r.hset(key, mapping=mapping)
-    except Exception as e:
-        log_agent_event(key, f"Redis error: {str(e)}")
-
-# === Enhanced Sidebar: Agentic AI Chat & Status ===
-st.sidebar.header("Agentic AI Control & Chat")
-user_message = st.sidebar.text_input("Ask the AI agent something:", "How are deliveries going?")
-if st.sidebar.button("Send to Agent"):
-    # Simulate agentic response (could be LLM in future)
-    response = f"Agent: Based on current memory, deliveries are {'on track' if avg_delivery_time < 60 else 'delayed'}. Traffic zone at {traffic_zone}."
-    st.sidebar.success(response)
-
-# === Optional: Integration with Local LLMs (Ollama, etc.) ===
-def llm_agent_reasoning(vehicle_id, context):
-    # Placeholder: If Ollama or other LLM is available, call it here
-    # Otherwise, fallback to rule-based
-    try:
-        # import ollama, call ollama.chat() etc.
-        return get_advanced_agent_reasoning(vehicle_id)
-    except Exception:
-        return get_advanced_agent_reasoning(vehicle_id)
-
-# === Agent Reasoning: Simple rule-based agent ===
-def get_agent_reasoning(vehicle_id):
-    memory = r.lrange(f"vehicle:{vehicle_id}:memory", -5, -1)
-    recent_events = [json.loads(e)["event"] for e in memory]
-    if any("Rerouted" in e for e in recent_events):
-        return "Avoided traffic recently, will try to optimize next route."
-    if any("Delivered package" in e for e in recent_events):
-        return "Focused on deliveries, monitoring for traffic."
-    return "No recent events."
-
-# === Show agent thoughts in sidebar (after function definitions) ===
-for v_id in range(NUM_VEHICLES):
-    thought = llm_agent_reasoning(v_id, None)
-    st.sidebar.markdown(f"<div style='background:#f0f8ff;padding:8px;border-radius:6px;margin-bottom:4px;'><b>🚚 Vehicle {v_id}:</b> <i>{thought}</i></div>", unsafe_allow_html=True)
-
-# === Optional: More Business Metrics, Historical Analytics ===
-st.subheader("Historical Analytics & Reporting")
-history = []
-for v_id in range(NUM_VEHICLES):
-    deliveries = int(safe_redis_hget(f"vehicle:{v_id}", "delivered", 0))
-    for d in range(1, deliveries + 1):
-        t = float(safe_redis_hget(f"vehicle:{v_id}", f"delivery_time_{d}", 0))
-        m = float(safe_redis_hget(f"vehicle:{v_id}", f"delivery_miles_{d}", 0))
-        history.append({"vehicle": v_id, "delivery": d, "time": t, "miles": m})
-history_df = pd.DataFrame(history)
-if not history_df.empty:
-    st.dataframe(history_df)
-    st.line_chart(history_df.groupby("vehicle")["miles"].sum())
-
-# === Enhanced Agent Reasoning in Dashboard (after function definitions) ===
-st.subheader("Agent Memory & Reasoning")
-for v_id in range(NUM_VEHICLES):
-    reasoning = get_agent_reasoning(v_id)
-    st.markdown(f"<b>🚚 Vehicle {v_id}:</b> <span style='color:#0066ff'>{reasoning}</span>", unsafe_allow_html=True)
-    memory = r.lrange(f"vehicle:{v_id}:memory", -3, -1)
-    for e in memory:
-        event = json.loads(e)
-        st.caption(f"{time.strftime('%H:%M:%S', time.localtime(event['time']))}: {event['event']}")
+# --- End of Orchestrator ---
