@@ -61,19 +61,14 @@ def initialize_simulation():
     """Generates orders and assigns them to vehicles, saving initial state to Redis."""
     r.flushdb() # Clear old data
     
-    # 1. Generate realistic Seattle-ish orders
-    np.random.seed(42)
-    orders = []
-    for i in range(NUM_ORDERS):
-        # 40% downtown (high density), 60% suburbs
-        if np.random.rand() < 0.4:
-            x = np.random.randint(6, 14)
-            y = np.random.randint(4, 16)
-        else:
-            x = np.random.randint(0, GRID_SIZE)
-            y = np.random.randint(0, GRID_SIZE)
-        orders.append({"id": i, "pos": (x, y), "delivered": False})
-        
+    # 1. Generate 4 orders in N/S/E/W directions from SODO depot
+    orders = [
+        {"id": 0, "pos": (DEPOT[0], DEPOT[1] + 8), "delivered": False},  # North
+        {"id": 1, "pos": (DEPOT[0], DEPOT[1] - 8), "delivered": False},  # South
+        {"id": 2, "pos": (DEPOT[0] + 8, DEPOT[1]), "delivered": False},  # East
+        {"id": 3, "pos": (DEPOT[0] - 8, DEPOT[1]), "delivered": False},  # West
+    ]
+    
     # 2. Initialize vehicles state in Redis
     for v_id in range(NUM_VEHICLES):
         r.hset(f"vehicle:{v_id}", mapping={
